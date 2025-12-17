@@ -7,6 +7,8 @@ import type { Camera } from "@/types";
 export default function CamerasPage() {
   const [cams, setCams] = useState<Camera[]>([]);
   const [err, setErr] = useState("");
+
+  // Add camera form
   const [newId, setNewId] = useState("");
   const [newName, setNewName] = useState("");
   const [newUrl, setNewUrl] = useState("");
@@ -29,6 +31,7 @@ export default function CamerasPage() {
     return () => clearInterval(t);
   }, []);
 
+  // ---------------- Camera CRUD ----------------
   async function addCamera() {
     try {
       setErr("");
@@ -56,11 +59,27 @@ export default function CamerasPage() {
     load();
   }
 
+  // ---------------- Attendance toggle ----------------
+  async function enableAttendance(cam: Camera) {
+    await postJSON("/api/attendance-control/enable", {
+      cameraId: cam.id,
+    });
+  }
+
+  async function disableAttendance(cam: Camera) {
+    await postJSON("/api/attendance-control/disable", {
+      cameraId: cam.id,
+    });
+  }
+
   return (
     <div>
+      {/* ------------------------------------------------ */}
+      {/* Header */}
+      {/* ------------------------------------------------ */}
       <h1 className="text-2xl font-bold">Camera Control Panel</h1>
       <p className="mt-1 text-sm text-gray-500">
-        Live preview via AI: {aiBase}
+        Live face recognition + attendance (AI: {aiBase})
       </p>
 
       {err ? (
@@ -69,11 +88,13 @@ export default function CamerasPage() {
         </div>
       ) : null}
 
-      {/* Add Camera Form */}
+      {/* ------------------------------------------------ */}
+      {/* Add Camera */}
+      {/* ------------------------------------------------ */}
       <div className="mt-6 rounded-xl border bg-white p-4">
         <div className="font-semibold">Add CCTV Camera (RTSP)</div>
         <p className="mt-1 text-xs text-gray-500">
-          Default laptop camera (cam1) is already available.
+          Laptop camera <b>cam1</b> is created automatically.
         </p>
 
         <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-4">
@@ -106,10 +127,13 @@ export default function CamerasPage() {
         </button>
       </div>
 
+      {/* ------------------------------------------------ */}
       {/* Camera Grid */}
+      {/* ------------------------------------------------ */}
       <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-2">
         {cams.map((c) => (
-          <div key={c.id} className="rounded-xl border bg-white p-3">
+          <div key={c.id} className="rounded-xl border bg-white p-3 shadow-sm">
+            {/* Header */}
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="font-semibold">{c.name}</div>
@@ -119,7 +143,7 @@ export default function CamerasPage() {
                 </div>
               </div>
 
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2">
                 {c.isActive ? (
                   <button
                     className="rounded-md border px-3 py-1 text-sm"
@@ -138,10 +162,11 @@ export default function CamerasPage() {
               </div>
             </div>
 
+            {/* Stream */}
             <div className="mt-3 overflow-hidden rounded-lg border bg-gray-100">
               {c.isActive ? (
                 <img
-                  src={`${aiBase}/camera/stream/${c.id}`}
+                  src={`${aiBase}/camera/recognition/stream/${c.id}`}
                   className="h-64 w-full object-cover"
                 />
               ) : (
@@ -149,6 +174,22 @@ export default function CamerasPage() {
                   Camera OFF
                 </div>
               )}
+            </div>
+
+            {/* Attendance Control */}
+            <div className="mt-3 flex gap-2">
+              <button
+                className="rounded-md border px-3 py-1 text-xs"
+                onClick={() => enableAttendance(c)}
+              >
+                Enable Attendance
+              </button>
+              <button
+                className="rounded-md border px-3 py-1 text-xs"
+                onClick={() => disableAttendance(c)}
+              >
+                Disable Attendance
+              </button>
             </div>
           </div>
         ))}
