@@ -204,6 +204,8 @@ def attendance_enabled(camera_id: str):
 # --------------------------------------------------
 # Enrollment (Browser-based)
 # --------------------------------------------------
+_ALLOWED_ANGLES = {"front", "left", "right", "up", "down"}
+
 @app.post("/enroll/session/start")
 def enroll_session_start(payload: dict = Body(...)):
     employee_id = str(payload.get("employeeId") or "").strip()
@@ -232,3 +234,90 @@ def enroll_session_stop():
 def enroll_session_status():
     s = enroller.status()
     return {"ok": True, "session": (s.__dict__ if s else None)}
+
+# --------------------------------------------------
+# Enrollment (UI Controls) - NEW
+# Buttons: change angle, capture, save, cancel
+# --------------------------------------------------
+@app.post("/enroll/session/angle")
+def enroll_session_set_angle(payload: dict = Body(...)):
+    angle = str(payload.get("angle") or "").strip().lower()
+    if angle not in _ALLOWED_ANGLES:
+        return {"ok": False, "error": f"Invalid angle. Allowed: {sorted(_ALLOWED_ANGLES)}"}
+
+    try:
+        s = enroller.set_angle(angle)
+        return {"ok": True, "session": (s.__dict__ if s else None)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/enroll/session/capture")
+def enroll_session_capture(payload: dict = Body(None)):
+    """
+    Captures current frame embedding for the session's current angle.
+    Optionally accepts: { "angle": "front|left|right|up|down" } to set angle then capture.
+    """
+    try:
+        if isinstance(payload, dict) and payload.get("angle"):
+            angle = str(payload.get("angle") or "").strip().lower()
+            if angle not in _ALLOWED_ANGLES:
+                return {"ok": False, "error": f"Invalid angle. Allowed: {sorted(_ALLOWED_ANGLES)}"}
+            enroller.set_angle(angle)
+
+        result = enroller.capture()
+        s = enroller.status()
+        return {
+            "ok": True,
+            "result": result,
+            "session": (s.__dict__ if s else None),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/enroll/session/save")
+def enroll_session_save():
+    """
+    Saves all staged angle embeddings to backend DB (FaceTemplate upsert),
+    then clears staged captures.
+    """
+    try:
+        result = enroller.save()
+        s = enroller.status()
+        return {
+            "ok": True,
+            "result": result,
+            "session": (s.__dict__ if s else None),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/enroll/session/cancel")
+def enroll_session_cancel():
+    """
+    Clears staged captures (undo) but keeps session running.
+    """
+    try:
+        result = enroller.cancel()
+        s = enroller.status()
+        return {
+            "ok": True,
+            "result": result,
+            "session": (s.__dict__ if s else None),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    
+
+@app.post("/enroll/session/clear-angle")
+def enroll_session_clear_angle(payload: dict = Body(...)):
+    try:
+        angle = str(payload.get("angle") or "").strip().lower()
+        result = enroller.clear_angle(angle)
+        s = enroller.status()
+        return {"ok": True, "result": result, "session": (s.__dict__ if s else None)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+

@@ -1,4 +1,5 @@
-import Card from "@/components/ui/Card";
+import { Card } from "@/components/ui/Card";
+
 import { Employee } from "@/types";
 
 export default function EmployeesList({
