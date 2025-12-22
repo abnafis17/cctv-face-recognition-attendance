@@ -7,7 +7,7 @@ import numpy as np
 
 from .antispoof import AntiSpoofONNX
 from .motion import MotionGate
-from .heuristics import sharpness_heuristic
+from .heuristics import sharpness_heuristic, close_face_block
 
 BBox = Tuple[int, int, int, int]
 
@@ -16,10 +16,17 @@ BBox = Tuple[int, int, int, int]
 class GateConfig:
     enabled: bool = True
     fas_threshold: float = 0.55
-    motion_window_sec: float = 1.5
-    min_yaw_range: float = 0.035  # ✅ yaw change threshold
+
+    motion_window_sec: float = 2.0
+    min_yaw_range: float = 0.02
+
     use_heuristics: bool = True
     heuristics_max_var: float = 900.0
+
+    # ✅ NEW: strict anti-phone-near-camera rules
+    close_face_max_area_ratio: float = 0.18
+    close_face_max_width_ratio: float = 0.60
+
     cooldown_sec: float = 2.0
 
 
@@ -66,6 +73,8 @@ class FASGate:
         min_yaw_range: Optional[float] = None,
         motion_window_sec: Optional[float] = None,
         use_heuristics: Optional[bool] = None,
+        close_face_max_area_ratio: Optional[float] = None,
+        close_face_max_width_ratio: Optional[float] = None,
     ) -> GateConfig:
         cid = str(camera_id)
         base = self.cfg_by_camera.get(cid, self.default_cfg)
@@ -79,6 +88,10 @@ class FASGate:
             cfg.motion_window_sec = float(motion_window_sec)
         if use_heuristics is not None:
             cfg.use_heuristics = bool(use_heuristics)
+        if close_face_max_area_ratio is not None:
+            cfg.close_face_max_area_ratio = float(close_face_max_area_ratio)
+        if close_face_max_width_ratio is not None:
+            cfg.close_face_max_width_ratio = float(close_face_max_width_ratio)
 
         self.cfg_by_camera[cid] = cfg
         return cfg
@@ -104,6 +117,17 @@ class FASGate:
             return False, {"fas": "cooldown"}
 
         if cfg.use_heuristics:
+            # ✅ NEW strict rule: block "face too close" (phone near camera)
+            cr = close_face_block(
+                frame_bgr,
+                bbox,
+                max_face_area_ratio=cfg.close_face_max_area_ratio,
+                max_face_width_ratio=cfg.close_face_max_width_ratio,
+            )
+            if not cr.ok:
+                return False, {"fas": "heuristic_block", "h_score": cr.score, "h_reason": cr.reason}
+
+            # Existing sharpness rule
             hr = sharpness_heuristic(frame_bgr, bbox, max_var=cfg.heuristics_max_var)
             if not hr.ok:
                 return False, {"fas": "heuristic_block", "h_score": hr.score, "h_reason": hr.reason}
