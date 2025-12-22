@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -11,6 +12,8 @@ from .backend_client import BackendClient
 from .recognizer import FaceRecognizer, match_gallery
 from .tracker import SimpleTracker
 from .utils import now_iso, l2_normalize
+
+from .fas.gate import FASGate, GateConfig
 
 
 @dataclass
@@ -21,11 +24,39 @@ class CameraScanState:
 
 
 def _put_text_white(img: np.ndarray, text: str, x: int, y: int, scale: float = 0.8) -> None:
-    """White text with black outline (OpenCV imshow style)."""
     font = cv2.FONT_HERSHEY_SIMPLEX
     thickness = 2
     cv2.putText(img, text, (x, y), font, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
     cv2.putText(img, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+
+def _nearest_kps(track_bbox: Tuple[int, int, int, int],
+                 det_kps_map: Dict[Tuple[int, int, int, int], Optional[np.ndarray]],
+                 max_center_dist: float = 50.0) -> Optional[np.ndarray]:
+    """
+    Tracker bbox is often slightly different from detector bbox.
+    This finds the nearest detector bbox center and returns its kps.
+    """
+    tx1, ty1, tx2, ty2 = track_bbox
+    tcx = (tx1 + tx2) / 2.0
+    tcy = (ty1 + ty2) / 2.0
+
+    best_kps = None
+    best_d = 1e18
+
+    for (x1, y1, x2, y2), kps in det_kps_map.items():
+        if kps is None:
+            continue
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        d = ((cx - tcx) ** 2 + (cy - tcy) ** 2) ** 0.5
+        if d < best_d:
+            best_d = d
+            best_kps = kps
+
+    if best_kps is None or best_d > max_center_dist:
+        return None
+    return best_kps
 
 
 class AttendanceRuntime:
@@ -50,16 +81,41 @@ class AttendanceRuntime:
         self._gallery_last_load = 0.0
         self._gallery_matrix: np.ndarray = np.zeros((0, 512), dtype=np.float32)
 
-        # we keep int ids for tracker, but map them to real string ids
         self._gallery_meta: List[Tuple[int, str, str]] = []  # (emp_int, emp_id_str, name)
 
         self._cam_state: Dict[str, CameraScanState] = {}
         self._enabled_for_attendance: Dict[str, bool] = {}
 
-        # stable mapping for non-numeric employee ids
         self._emp_id_to_int: Dict[str, int] = {}
         self._int_to_emp_id: Dict[int, str] = {}
-        self._next_emp_int: int = 1_000_000  # start high to avoid collision with numeric IDs
+        self._next_emp_int: int = 1_000_000
+
+        # ---------------------------
+        # Face Anti-Spoofing (FAS)
+        # ---------------------------
+        fas_enabled = os.getenv("FAS_ENABLED", "1") == "1"
+        fas_onnx_path = os.getenv("FAS_ONNX_PATH", "app/fas/models/fas.onnx")
+
+        # Backward compatible:
+        # - new: FAS_MIN_YAW_RANGE
+        # - old: FAS_MIN_MOTION_PX (we map it to yaw range if new one not set)
+        min_yaw_range = os.getenv("FAS_MIN_YAW_RANGE")
+        if min_yaw_range is None:
+            min_yaw_range = os.getenv("FAS_MIN_MOTION_PX", "0.035")
+
+        self.fas_gate = FASGate(
+            onnx_path=fas_onnx_path,
+            providers=["CPUExecutionProvider"],
+            default_cfg=GateConfig(
+                enabled=fas_enabled,
+                fas_threshold=float(os.getenv("FAS_THRESHOLD", "0.55")),
+                motion_window_sec=float(os.getenv("FAS_MOTION_WINDOW", "1.5")),
+                min_yaw_range=float(min_yaw_range),
+                use_heuristics=(os.getenv("FAS_USE_HEURISTICS", "1") == "1"),
+                cooldown_sec=float(os.getenv("FAS_COOLDOWN_SEC", "2.0")),
+            ),
+            input_size=(112, 112),
+        )
 
     def set_attendance_enabled(self, camera_id: str, enabled: bool) -> None:
         self._enabled_for_attendance[str(camera_id)] = bool(enabled)
@@ -69,13 +125,11 @@ class AttendanceRuntime:
 
     def _emp_str_to_int(self, emp_id_str: str) -> int:
         emp_id_str = str(emp_id_str)
-        # if numeric, keep numeric (stable)
         if emp_id_str.isdigit():
             v = int(emp_id_str)
             self._int_to_emp_id[v] = emp_id_str
             return v
 
-        # otherwise map to stable internal int
         if emp_id_str in self._emp_id_to_int:
             return self._emp_id_to_int[emp_id_str]
 
@@ -110,7 +164,6 @@ class AttendanceRuntime:
             emb = l2_normalize(emb)
 
             name = str(t.get("employeeName") or t.get("employee_name") or t.get("name") or emp_id_str)
-
             emp_int = self._emp_str_to_int(emp_id_str)
 
             embs.append(emb)
@@ -141,17 +194,18 @@ class AttendanceRuntime:
 
         dets = self.rec.detect_and_embed(frame_bgr)
 
-        # tracker dets: (bbox, name, emp_int, sim)
         det_list = []
-        det_extra: List[Tuple[int, str, str, float]] = []  # (emp_int, emp_id_str, name, sim) not used by tracker
+        det_kps_by_bbox: Dict[Tuple[int, int, int, int], Optional[np.ndarray]] = {}
 
         for d in dets:
             idx, sim = match_gallery(d.emb, self._gallery_matrix) if self._gallery_matrix.size else (-1, -1.0)
 
+            bbox_key = tuple(int(v) for v in d.bbox)
+            det_kps_by_bbox[bbox_key] = d.kps
+
             if idx != -1 and sim >= self.similarity_threshold:
                 emp_int, emp_id_str, name = self._gallery_meta[idx]
                 det_list.append((d.bbox, name, int(emp_int), float(sim)))
-                det_extra.append((int(emp_int), emp_id_str, name, float(sim)))
             else:
                 det_list.append((d.bbox, "Unknown", -1, float(sim)))
 
@@ -178,7 +232,6 @@ class AttendanceRuntime:
             label = f"{name} | sim={tr.similarity:.2f} | {ts_now}"
             _put_text_white(annotated, label, x1, max(24, y1 - 10), scale=0.8)
 
-            # --- attendance ---
             if not enable_attendance:
                 continue
             if not known:
@@ -191,9 +244,35 @@ class AttendanceRuntime:
             if now - last < self.cooldown_s:
                 continue
 
+            bbox_key = (x1, y1, x2, y2)
+
+            # ✅ IMPORTANT: nearest kps match (tracker bbox != detector bbox)
+            face_kps = _nearest_kps(bbox_key, det_kps_by_bbox)
+
+            fas_ok, fas_dbg = self.fas_gate.check(
+                camera_id=cid,
+                person_key=emp_id_str,
+                frame_bgr=frame_bgr,
+                bbox=bbox_key,
+                kps=face_kps,
+            )
+
+            print(
+                "[FAS DEBUG]",
+                "emp=", emp_id_str,
+                "ok=", fas_ok,
+                "dbg=", fas_dbg,
+                "kps_none=", face_kps is None
+            )
+
+            if not fas_ok:
+                # Optional debug overlay:
+                # _put_text_white(annotated, f"FAS BLOCK: {fas_dbg.get('fas')}", x1, y2 + 22, scale=0.7)
+                continue
+
             try:
                 self.client.create_attendance(
-                    employee_id=emp_id_str,  # ✅ REAL string ID goes to backend
+                    employee_id=emp_id_str,
                     timestamp=now_iso(),
                     camera_id=cid,
                     confidence=float(tr.similarity),
