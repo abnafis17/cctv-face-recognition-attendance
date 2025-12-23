@@ -15,7 +15,7 @@ BBox = Tuple[int, int, int, int]
 @dataclass
 class GateConfig:
     enabled: bool = True
-    fas_threshold: float = 0.55
+    fas_threshold: float = 0.65
 
     motion_window_sec: float = 2.0
     min_yaw_range: float = 0.02
@@ -23,7 +23,6 @@ class GateConfig:
     use_heuristics: bool = True
     heuristics_max_var: float = 900.0
 
-    # ✅ NEW: strict anti-phone-near-camera rules
     close_face_max_area_ratio: float = 0.18
     close_face_max_width_ratio: float = 0.60
 
@@ -55,47 +54,25 @@ class FASGate:
 
         self._last_pass: Dict[str, float] = {}
 
+    def get_camera_cfg(self, camera_id: str) -> GateConfig:
+        return self.cfg_by_camera.get(str(camera_id), self.default_cfg)
+
     def set_camera_enabled(self, camera_id: str, enabled: bool) -> None:
         cid = str(camera_id)
         cfg = self.cfg_by_camera.get(cid, GateConfig(**self.default_cfg.__dict__))
         cfg.enabled = bool(enabled)
         self.cfg_by_camera[cid] = cfg
 
-    def get_camera_cfg(self, camera_id: str) -> GateConfig:
-        cid = str(camera_id)
-        return self.cfg_by_camera.get(cid, self.default_cfg)
+    # ✅ Lightweight: used for overlay smoothing only
+    def score_only(self, camera_id: str, frame_bgr: np.ndarray, bbox: BBox) -> Tuple[float, Dict[str, Any]]:
+        cfg = self.get_camera_cfg(camera_id)
+        if not cfg.enabled:
+            return 1.0, {"score": 1.0, "reason": "fas_disabled"}
+        self.model.threshold = cfg.fas_threshold
+        r = self.model.predict(frame_bgr, bbox)
+        return float(r.score), {"score": float(r.score), "reason": r.reason}
 
-    def set_camera_params(
-        self,
-        camera_id: str,
-        *,
-        fas_threshold: Optional[float] = None,
-        min_yaw_range: Optional[float] = None,
-        motion_window_sec: Optional[float] = None,
-        use_heuristics: Optional[bool] = None,
-        close_face_max_area_ratio: Optional[float] = None,
-        close_face_max_width_ratio: Optional[float] = None,
-    ) -> GateConfig:
-        cid = str(camera_id)
-        base = self.cfg_by_camera.get(cid, self.default_cfg)
-        cfg = GateConfig(**base.__dict__)
-
-        if fas_threshold is not None:
-            cfg.fas_threshold = float(fas_threshold)
-        if min_yaw_range is not None:
-            cfg.min_yaw_range = float(min_yaw_range)
-        if motion_window_sec is not None:
-            cfg.motion_window_sec = float(motion_window_sec)
-        if use_heuristics is not None:
-            cfg.use_heuristics = bool(use_heuristics)
-        if close_face_max_area_ratio is not None:
-            cfg.close_face_max_area_ratio = float(close_face_max_area_ratio)
-        if close_face_max_width_ratio is not None:
-            cfg.close_face_max_width_ratio = float(close_face_max_width_ratio)
-
-        self.cfg_by_camera[cid] = cfg
-        return cfg
-
+    # ✅ Strict: used ONLY before writing attendance
     def check(
         self,
         camera_id: str,
@@ -117,7 +94,6 @@ class FASGate:
             return False, {"fas": "cooldown"}
 
         if cfg.use_heuristics:
-            # ✅ NEW strict rule: block "face too close" (phone near camera)
             cr = close_face_block(
                 frame_bgr,
                 bbox,
@@ -127,7 +103,6 @@ class FASGate:
             if not cr.ok:
                 return False, {"fas": "heuristic_block", "h_score": cr.score, "h_reason": cr.reason}
 
-            # Existing sharpness rule
             hr = sharpness_heuristic(frame_bgr, bbox, max_var=cfg.heuristics_max_var)
             if not hr.ok:
                 return False, {"fas": "heuristic_block", "h_score": hr.score, "h_reason": hr.reason}
@@ -138,10 +113,10 @@ class FASGate:
         if not r.is_live:
             return False, {"fas": "model_spoof", "score": r.score}
 
-        # yaw motion
+        # motion (yaw range)
         self.motion.window_sec = cfg.motion_window_sec
         self.motion.min_yaw_range = cfg.min_yaw_range
-        m_ok, m_score = self.motion.update_and_check(key, kps)
+        m_ok, m_score = self.motion.update_and_check(f"{camera_id}:{person_key}", kps)
         if not m_ok:
             return False, {"fas": "need_pose_change", "score": r.score, "yaw_range": m_score}
 

@@ -4,6 +4,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
+from collections import deque
 
 import cv2
 import numpy as np
@@ -23,6 +24,16 @@ class CameraScanState:
     frame_idx: int = 0
 
 
+@dataclass
+class LivenessState:
+    ema: float = 0.5
+    last_ts: float = 0.0
+    human_hits: int = 0
+    spoof_hits: int = 0
+    # sticky state (prevents flicker)
+    is_human: bool = False
+
+
 def _put_text_white(img: np.ndarray, text: str, x: int, y: int, scale: float = 0.8) -> None:
     font = cv2.FONT_HERSHEY_SIMPLEX
     thickness = 2
@@ -30,13 +41,11 @@ def _put_text_white(img: np.ndarray, text: str, x: int, y: int, scale: float = 0
     cv2.putText(img, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
-def _nearest_kps(track_bbox: Tuple[int, int, int, int],
-                 det_kps_map: Dict[Tuple[int, int, int, int], Optional[np.ndarray]],
-                 max_center_dist: float = 50.0) -> Optional[np.ndarray]:
-    """
-    Tracker bbox is often slightly different from detector bbox.
-    This finds the nearest detector bbox center and returns its kps.
-    """
+def _nearest_kps(
+    track_bbox: Tuple[int, int, int, int],
+    det_kps_map: Dict[Tuple[int, int, int, int], Optional[np.ndarray]],
+    max_center_dist: float = 60.0,
+) -> Optional[np.ndarray]:
     tx1, ty1, tx2, ty2 = track_bbox
     tcx = (tx1 + tx2) / 2.0
     tcy = (ty1 + ty2) / 2.0
@@ -57,6 +66,35 @@ def _nearest_kps(track_bbox: Tuple[int, int, int, int],
     if best_kps is None or best_d > max_center_dist:
         return None
     return best_kps
+
+
+def _clip_bbox(b: Tuple[int, int, int, int], w: int, h: int) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = map(int, b)
+    x1 = max(0, min(x1, w - 1))
+    y1 = max(0, min(y1, h - 1))
+    x2 = max(0, min(x2, w - 1))
+    y2 = max(0, min(y2, h - 1))
+    if x2 <= x1:
+        x2 = min(w - 1, x1 + 1)
+    if y2 <= y1:
+        y2 = min(h - 1, y1 + 1)
+    return x1, y1, x2, y2
+
+
+def _face_blur_score(frame_bgr: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+    """
+    Laplacian variance blur metric:
+      - low value => blurry (movement)
+      - high value => sharp
+    """
+    h, w = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = _clip_bbox(bbox, w, h)
+    crop = frame_bgr[y1:y2, x1:x2]
+    if crop.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
 class AttendanceRuntime:
@@ -80,7 +118,6 @@ class AttendanceRuntime:
 
         self._gallery_last_load = 0.0
         self._gallery_matrix: np.ndarray = np.zeros((0, 512), dtype=np.float32)
-
         self._gallery_meta: List[Tuple[int, str, str]] = []  # (emp_int, emp_id_str, name)
 
         self._cam_state: Dict[str, CameraScanState] = {}
@@ -90,32 +127,46 @@ class AttendanceRuntime:
         self._int_to_emp_id: Dict[int, str] = {}
         self._next_emp_int: int = 1_000_000
 
-        # ---------------------------
-        # Face Anti-Spoofing (FAS)
-        # ---------------------------
+        # per-camera per-track liveness smoothing
+        self._live_state: Dict[str, Dict[int, LivenessState]] = {}
+
+        # -------------
+        # FAS
+        # -------------
         fas_enabled = os.getenv("FAS_ENABLED", "1") == "1"
         fas_onnx_path = os.getenv("FAS_ONNX_PATH", "app/fas/models/fas.onnx")
 
-        # Backward compatible:
-        # - new: FAS_MIN_YAW_RANGE
-        # - old: FAS_MIN_MOTION_PX (we map it to yaw range if new one not set)
         min_yaw_range = os.getenv("FAS_MIN_YAW_RANGE")
         if min_yaw_range is None:
-            min_yaw_range = os.getenv("FAS_MIN_MOTION_PX", "0.035")
+            min_yaw_range = os.getenv("FAS_MIN_MOTION_PX", "0.02")
 
         self.fas_gate = FASGate(
             onnx_path=fas_onnx_path,
             providers=["CPUExecutionProvider"],
             default_cfg=GateConfig(
                 enabled=fas_enabled,
-                fas_threshold=float(os.getenv("FAS_THRESHOLD", "0.55")),
-                motion_window_sec=float(os.getenv("FAS_MOTION_WINDOW", "1.5")),
+                fas_threshold=float(os.getenv("FAS_THRESHOLD", "0.65")),
+                motion_window_sec=float(os.getenv("FAS_MOTION_WINDOW", "2.0")),
                 min_yaw_range=float(min_yaw_range),
                 use_heuristics=(os.getenv("FAS_USE_HEURISTICS", "1") == "1"),
                 cooldown_sec=float(os.getenv("FAS_COOLDOWN_SEC", "2.0")),
             ),
             input_size=(112, 112),
         )
+
+        # ✅ Overlay stability tuning (does NOT affect attendance security)
+        self._ema_alpha = float(os.getenv("FAS_OVERLAY_EMA_ALPHA", "0.20"))
+
+        # Make HUMAN easier; SPOOF harder (reduces false NOT HUMAN)
+        self._human_on = float(os.getenv("FAS_HUMAN_ON", "0.60"))
+        self._human_off = float(os.getenv("FAS_HUMAN_OFF", "0.35"))
+
+        # Need fewer hits to become HUMAN, more hits to become SPOOF
+        self._need_human_hits = int(os.getenv("FAS_HUMAN_NEED_HITS", "2"))
+        self._need_spoof_hits = int(os.getenv("FAS_SPOOF_NEED_HITS", "6"))
+
+        # Blur guard: if face is blurry, do NOT flip to spoof quickly
+        self._blur_hold_var = float(os.getenv("FAS_BLUR_HOLD_VAR", "70"))
 
     def set_attendance_enabled(self, camera_id: str, enabled: bool) -> None:
         self._enabled_for_attendance[str(camera_id)] = bool(enabled)
@@ -194,15 +245,14 @@ class AttendanceRuntime:
 
         dets = self.rec.detect_and_embed(frame_bgr)
 
-        det_list = []
+        det_list: List[Tuple[np.ndarray, str, int, float]] = []
         det_kps_by_bbox: Dict[Tuple[int, int, int, int], Optional[np.ndarray]] = {}
 
         for d in dets:
-            idx, sim = match_gallery(d.emb, self._gallery_matrix) if self._gallery_matrix.size else (-1, -1.0)
-
             bbox_key = tuple(int(v) for v in d.bbox)
             det_kps_by_bbox[bbox_key] = d.kps
 
+            idx, sim = match_gallery(d.emb, self._gallery_matrix) if self._gallery_matrix.size else (-1, -1.0)
             if idx != -1 and sim >= self.similarity_threshold:
                 emp_int, emp_id_str, name = self._gallery_meta[idx]
                 det_list.append((d.bbox, name, int(emp_int), float(sim)))
@@ -214,24 +264,80 @@ class AttendanceRuntime:
             dets=[(bbox, name, emp_int, sim) for (bbox, name, emp_int, sim) in det_list],
         )
 
+        cam_ls = self._live_state.setdefault(cid, {})
+
+        # cleanup liveness states for removed tracks
+        live_ids = set(tr.track_id for tr in tracks)
+        for tid in list(cam_ls.keys()):
+            if tid not in live_ids:
+                cam_ls.pop(tid, None)
+
         for tr in tracks:
             x1, y1, x2, y2 = [int(v) for v in tr.bbox]
+            bbox_key = (x1, y1, x2, y2)
+
+            ls = cam_ls.get(tr.track_id)
+            if ls is None:
+                ls = LivenessState()
+                cam_ls[tr.track_id] = ls
+
+            # raw liveness score (overlay only)
+            raw_score, _ = self.fas_gate.score_only(camera_id=cid, frame_bgr=frame_bgr, bbox=bbox_key)
+
+            # EMA smoothing
+            a = self._ema_alpha
+            ls.ema = (1.0 - a) * ls.ema + a * float(raw_score)
+            ls.last_ts = time.time()
+
+            # blur guard
+            blur_var = _face_blur_score(frame_bgr, bbox_key)
+            is_blurry = blur_var < self._blur_hold_var
+
+            # Update hysteresis counters
+            if ls.ema >= self._human_on:
+                ls.human_hits += 1
+                ls.spoof_hits = 0
+            elif ls.ema <= self._human_off:
+                # If blurry, DON'T count spoof hits aggressively (prevents false NOT HUMAN)
+                if not is_blurry:
+                    ls.spoof_hits += 1
+                else:
+                    ls.spoof_hits = max(0, ls.spoof_hits - 1)
+                ls.human_hits = 0
+            else:
+                # uncertain: decay slowly
+                ls.human_hits = max(0, ls.human_hits - 1)
+                ls.spoof_hits = max(0, ls.spoof_hits - 1)
+
+            # sticky state transitions
+            if ls.human_hits >= self._need_human_hits:
+                ls.is_human = True
+            if ls.spoof_hits >= self._need_spoof_hits:
+                ls.is_human = False
+
+            # ---- draw
+            if not ls.is_human:
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 255), 3)
+                _put_text_white(
+                    annotated,
+                    f"NOT HUMAN (SPOOF) | live={ls.ema:.2f} | blur={blur_var:.0f}",
+                    x1,
+                    max(24, y1 - 10),
+                    scale=0.8,
+                )
+                continue
 
             known = (tr.employee_id != -1)
             color = (0, 255, 0) if known else (0, 0, 255)
-
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
 
-            if known:
-                emp_id_str = self._emp_int_to_str(tr.employee_id)
-                name = tr.name
-            else:
-                emp_id_str = "-1"
-                name = "Unknown"
+            emp_id_str = self._emp_int_to_str(tr.employee_id) if known else "-1"
+            name = tr.name if known else "Unknown"
 
-            label = f"{name} | sim={tr.similarity:.2f} | {ts_now}"
+            label = f"{name} | sim={tr.similarity:.2f} | live={ls.ema:.2f} | {ts_now}"
             _put_text_white(annotated, label, x1, max(24, y1 - 10), scale=0.8)
 
+            # attendance (still strict)
             if not enable_attendance:
                 continue
             if not known:
@@ -244,30 +350,16 @@ class AttendanceRuntime:
             if now - last < self.cooldown_s:
                 continue
 
-            bbox_key = (x1, y1, x2, y2)
-
-            # ✅ IMPORTANT: nearest kps match (tracker bbox != detector bbox)
             face_kps = _nearest_kps(bbox_key, det_kps_by_bbox)
 
-            fas_ok, fas_dbg = self.fas_gate.check(
+            fas_ok, _ = self.fas_gate.check(
                 camera_id=cid,
                 person_key=emp_id_str,
                 frame_bgr=frame_bgr,
                 bbox=bbox_key,
                 kps=face_kps,
             )
-
-            print(
-                "[FAS DEBUG]",
-                "emp=", emp_id_str,
-                "ok=", fas_ok,
-                "dbg=", fas_dbg,
-                "kps_none=", face_kps is None
-            )
-
             if not fas_ok:
-                # Optional debug overlay:
-                # _put_text_white(annotated, f"FAS BLOCK: {fas_dbg.get('fas')}", x1, y2 + 22, scale=0.7)
                 continue
 
             try:
